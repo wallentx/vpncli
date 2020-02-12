@@ -1,0 +1,171 @@
+#!/bin/bash
+
+# : <<'END'
+
+# Description:
+#   - Connect to a VPN that requires a MFA token, and automatically pass OTP.
+#   - Supports multiple VPN profiles/connections.
+#   - Password can be provided instead of OTP with modification of this script.
+
+# Dependencies:
+#   - Node-authenticator: https://www.npmjs.com/package/authenticator
+#   - OpenVPN: https://github.com/OpenVPN
+#   - Assumes you have your '*.ovpn' profiles saved to `$HOME/.vpncli/profiles/`
+
+# END
+
+# Functions
+#   Usage display:
+Usage() {
+cat <<EOF
+
+Description:  Connect to a VPN that requires a MFA token, and automatically pass OTP.
+              Supports multiple VPN profiles/connections.
+              Password can be provided instead of OTP with modification of this script.
+
+      Usage:  $(basename "$0") [-h] [-d] [-l] [-p <PROFILE_NAME>] [-s <PROFILE_NAME>]
+
+      Where:  -h  show this help text
+              -d  disconnect from VPN
+              -l  list profiles
+              -p  connect using the specified profile
+              -s  set the default VPN profile to use (current default: $DEFAULT)"
+EOF
+exit 1
+}
+
+#   Dependency check:
+DepCheck() {
+  # Authenticator:
+  if [[ ! -x $(command -v authenticator) ]]; then
+    echo "Node package: 'authenticator-cli' is not installed."
+    echo "Please install it with 'npm install authenticator-cli --global' and try again"
+    exit 1
+  fi
+  # OpenVPN:
+  if [[ ! -x $(command -v openvpn) ]]; then
+    echo "OpenVPN is not installed."
+    echo "Please install this via your package manager and try again"
+    exit 1
+  fi
+}
+
+DepCheck
+
+# Variables
+PROFILE_PATH="$HOME/.vpncli/profiles"
+if [[ ! -d $PROFILE_PATH ]]; then
+  mkdir -p "$PROFILE_PATH"
+fi
+
+PROFILES="$(cd "$PROFILE_PATH"/ && find -- * -maxdepth 0 -type d -print0 | xargs -0)"
+
+# shellcheck source=/dev/null
+source "$HOME"/.vpncli/config
+PROFILE="$DEFAULT"
+
+while getopts "hdlp:s:" OPTION
+do
+  case $OPTION in
+    d | --disconnect*)
+      sudo killall openvpn
+      exit
+      ;;
+    p | --profile*)
+      INPUT=${OPTARG}
+      if [[ " ${PROFILES[@]} " =~ " ${INPUT} " ]]; then
+        PROFILE=${OPTARG}
+      else
+        echo "'${OPTARG}' does not match an existing profile directory. Please check the spelling and try again."
+        echo "You can list valid profile directories with:  $(basename "$0") -l"
+        exit 1
+      fi
+      ;;
+    l | --list*)
+      echo "Profiles:"
+      for p in ${PROFILES[*]}; do
+        echo -e "\t$p"
+      done
+      exit
+      ;;
+    s | --save*)
+      INPUT=${OPTARG}
+      if [[ " ${PROFILES[@]} " =~ " ${INPUT} " ]]; then
+        PROFILE=${OPTARG}
+        echo "DEFAULT=$PROFILE" > "$HOME"/.vpncli/config
+        echo "Saved default profile as $PROFILE"
+        exit 0
+      else
+        echo "'${OPTARG}' does not match an existing profile directory. Please check the spelling and try again."
+        echo "You can list valid profile directories with:  $(basename "$0") -l"
+        exit 1
+      fi
+      ;;
+    h | --help*)
+      Usage
+      exit
+      ;;
+  esac
+done
+
+echo "Connecting using profile: $PROFILE"
+
+VPNDIR="$PROFILE_PATH"/"$PROFILE"
+OVPNFILE=$(find "$VPNDIR"/*.ovpn)
+LOG_PATH="$HOME"/.local/share/openvpn
+mkdir -p "$LOG_PATH"
+LOGFILE="$LOG_PATH"/"$PROFILE".log
+touch "$LOGFILE"
+TMPAUTH="$VPNDIR"/.auth
+touch "$TMPAUTH"
+chmod 600 "$TMPAUTH"
+# Pull environment variables from .profile
+# shellcheck source=/dev/null
+source "$VPNDIR"/.profile
+
+vpnmfa() {
+  OTP=$(authenticator --account "$USERNAME" --issuer "$ISSUER" --key "$KEY" | sed -n -e 's/^Token: //p')
+  echo "$USERNAME" > "$TMPAUTH"
+  echo "$OTP" >> "$TMPAUTH"
+  sudo openvpn --verb 15\
+    --config "$OVPNFILE" \
+    --auth-user-pass "$TMPAUTH" \
+    --log "$LOGFILE" \
+    --daemon >> /dev/null
+}
+
+vpnnomfa() {
+  echo "$USERNAME" > "$TMPAUTH"
+  echo "$PASS" >> "$TMPAUTH"
+  sudo openvpn --verb 15 \
+    --config "$OVPNFILE" \
+    --auth-user-pass "$TMPAUTH" \
+    --log "$LOGFILE" \
+    --daemon >> /dev/null
+}
+
+vpnpush() {
+  sudo openvpn --verb 15 \
+    --config "$OVPNFILE" \
+    --log "$LOGFILE" \
+    --daemon >> /dev/null
+}
+
+if [[ $MFA == true ]]; then
+  vpnmfa
+elif [[ $PUSH == true ]]; then
+  vpnpush
+else
+  vpnnomfa
+fi
+
+if [[ $? -ne 0 ]]; then
+  tail "$LOGFILE"
+  echo "Error connecting"
+else
+  tail -f -n0 "$LOGFILE" | grep -q "Initialization Sequence Completed"
+  echo "VPN Connected to $PROFILE"
+  exit 0
+fi
+
+rm "$TMPAUTH"
